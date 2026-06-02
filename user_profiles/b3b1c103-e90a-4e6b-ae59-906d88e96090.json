@@ -1,0 +1,38 @@
+{
+  "core_slots": {
+    "budget_min": null,
+    "budget_max": 50000.0,
+    "body_type": "Sedan",
+    "fuel_type": "Gasoline",
+    "brand": "Honda",
+    "condition": null
+  },
+  "soft_preferences": {
+    "features": [],
+    "vibe": null
+  },
+  "viewed_models": [
+    "2025 Ford Bronco Raptor",
+    "2023 Dodge Charger GT",
+    "2025 Kia Telluride SX X-Line",
+    "2026 Hyundai PALISADE XRT Pro",
+    "2026 Hyundai PALISADE Calligraphy",
+    "2011 Mazda Mazda3 i Touring",
+    "2023 Mercedes-Benz C-Class C 300 4MATIC",
+    "2022 Mercedes-Benz E-Class E 350 4MATIC",
+    "2012 Mercedes-Benz E-Class E 550 4MATIC",
+    "2015 Mercedes-Benz E-Class E 350 Sport",
+    "2019 Mercedes-Benz E-Class E 300",
+    "2020 Mercedes-Benz E-Class E 350 4MATIC",
+    "2022 Mercedes-Benz E-Class E 350 RWD Sedan",
+    "2022 Mercedes-Benz E-Class 4MATIC",
+    "2013 Honda Civic EX",
+    "2012 Honda Accord 2.4 LX",
+    "2014 Honda Accord LX",
+    "2015 Honda Accord Sport",
+    "2013 Honda Civic LX"
+  ],
+  "excluded_brands": [
+    "Mazda"
+  ]
+}
