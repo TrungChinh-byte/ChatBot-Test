@@ -287,9 +287,16 @@ class AgenticState(TypedDict):
 
 class IntentDecision(BaseModel):
     intent: str = Field(
-        description="'specific' when the user names an exact car brand/model, "
-        "'vague' when they describe needs without a specific car, "
-        "'chitchat' for greetings or off-topic talk."
+        description="'analytics' when the user asks about website statistics, trends, rankings, "
+        "most popular brands, most posted cars, top rated, most reviewed, inventory counts, "
+        "or any aggregate/summary data about the platform. "
+        "'specs' when the user asks about technical specifications, features, "
+        "engine details, safety systems, or performance data of a specific car. "
+        "'specific' when the user wants to find/buy an exact car brand/model. "
+        "'vague' when they describe needs without a specific car. "
+        "'chitchat' for greetings or casual talk still related to cars/buying. "
+        "'off_topic' when the user talks about something completely unrelated to cars, "
+        "automotive, or vehicle shopping (e.g. cooking, weather, politics, games)."
     )
     brand: Optional[str] = Field(default=None, description="Exact car brand mentioned, else null.")
     model: Optional[str] = Field(default=None, description="Exact car model/name mentioned, else null.")
@@ -309,11 +316,26 @@ def _build_agentic_app(llm, vector_store):
                 (
                     "system",
                     "You route a car consultation assistant.\n"
-                    "intent='specific' when the user names an exact car brand or model "
-                    "(e.g. 'Show me BMW i5 specs').\n"
+                    "intent='analytics' when the user asks about website/platform statistics, "
+                    "trends, rankings, popularity, inventory summary, or aggregate data "
+                    "(e.g. 'What brand has the most listings?', 'Most popular car type?', "
+                    "'How many cars are on the site?', 'What are the top rated cars?', "
+                    "'Which models have the most reviews?').\n"
+                    "intent='specs' when the user asks about technical specifications, "
+                    "features, engine details, horsepower, torque, safety systems, "
+                    "drivetrain, MPG, dimensions, or performance data of a specific car "
+                    "(e.g. 'What are the safety features of BMW X5?', "
+                    "'How much horsepower does the Camry have?', "
+                    "'Tell me the specs of Honda Civic 2024').\n"
+                    "intent='specific' when the user wants to find, compare, or buy "
+                    "a specific car brand/model (e.g. 'Show me available BMW i5').\n"
                     "intent='vague' when the user describes needs, budget, or usage without "
                     "a specific car (e.g. 'I need a family car around $40,000').\n"
-                    "intent='chitchat' for greetings or unrelated talk.\n"
+                    "intent='chitchat' for greetings or casual talk still about cars "
+                    "(e.g. 'Hi', 'Thanks').\n"
+                    "intent='off_topic' when the message is completely unrelated to cars, "
+                    "automotive, or vehicle shopping (e.g. 'What is the weather today?', "
+                    "'Tell me a joke', 'How to cook pasta?').\n"
                     "Extract the exact brand and model if present, else null.",
                 ),
                 MessagesPlaceholder("chat_history"),
@@ -476,20 +498,273 @@ Reply in the same language the customer is using.
         print(f"[CONSULT] answer={answer!r}")
         return {"answer": answer}
 
+    def spec_retrieve(state: AgenticState):
+        brand = state.get("brand")
+        model = state.get("model")
+        feature_view = os.getenv("FEATURE_POST")
+        image_view = os.getenv("IMAGE_POST")
+
+        rows = sql_search_cars(brand=brand, model=model, limit=3)
+
+        if not rows:
+            return {"context": "No matching car found for spec lookup.", "messages": []}
+
+        spec_parts = []
+        for i, row in enumerate(rows, 1):
+            vin = row.get("VIN", "N/A")
+
+            features = get_feature(feature_view, vin) if feature_view else {}
+            if features:
+                feature_str = "\n".join(
+                    f"  - {f_type}: {', '.join(f_names)}"
+                    for f_type, f_names in features.items()
+                )
+            else:
+                feature_str = "  - No feature data"
+
+            images = get_image_urls(image_view, vin, 3) if image_view else []
+            img_str = "\n".join(f"  - {u}" for u in images) or "  - No images"
+
+            spec_parts.append(
+                f"--- Car {i} ---\n"
+                f"Title: {row.get('title', 'N/A')}\n"
+                f"Brand: {row.get('brand', 'N/A')}\n"
+                f"Engine: {row.get('engine', 'N/A')}\n"
+                f"Drivetrain: {row.get('drivetrain', 'N/A')}\n"
+                f"Fuel Type: {row.get('fuel_type', 'N/A')}\n"
+                f"Transmission: {row.get('transmission', 'N/A')}\n"
+                f"MPG: {row.get('mpg', 'N/A')}\n"
+                f"Mileage: {row.get('mileage', 'N/A')}\n"
+                f"Price: {row.get('price', 'N/A')}\n"
+                f"Exterior: {row.get('exterior_color', 'N/A')}\n"
+                f"Interior: {row.get('interior_color', 'N/A')}\n"
+                f"Post Link: {row.get('post_link', 'N/A')}\n"
+                f"Features:\n{feature_str}\n"
+                f"Images:\n{img_str}"
+            )
+
+        context = "\n\n".join(spec_parts)
+        print(f"[SPEC RETRIEVE] brand={brand} model={model} found={len(rows)}")
+        return {"context": context, "messages": []}
+
+    def spec_answer(state: AgenticState):
+        system_prompt = """You are a knowledgeable car technical advisor.
+
+The customer is asking about technical specifications or features of a specific car.
+Use ONLY the provided context to answer.
+1. Present specs in a clear, organized format grouped by category
+   (Performance, Drivetrain, Fuel Economy, Safety, Comfort, Technology, etc.).
+2. Highlight standout features relevant to the customer's question.
+3. If available, mention how the specs compare to segment averages.
+4. Include [View Details](post_link) when a link is available.
+5. If specs are not available, say so honestly.
+Reply in the same language the customer is using.
+"""
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                ("system", "Technical Context:\n{context}"),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
+            ]
+        )
+        chain = prompt | llm | StrOutputParser()
+        answer = chain.invoke(
+            {
+                "context": state.get("context", ""),
+                "chat_history": state["messages"],
+                "question": state["question"],
+            }
+        )
+        print(f"[SPEC ANSWER] answer={answer!r}")
+        return {"answer": answer}
+
+    def analytics_retrieve(state: AgenticState):
+        question = state["question"].lower()
+        queries = {}
+
+        queries["brand_counts"] = text(f"""
+            select brand, count(VIN) as total
+            from core.Car c join core.Brand b on c.brand_id = b.brand_id
+            join post.Post p on c.car_model = p.car_model
+            WHERE brand IS NOT NULL
+            GROUP BY brand
+            ORDER BY total DESC
+        """)
+
+        queries["fuel_type_counts"] = text(f"""
+            select ft.fuel_type, count(VIN) as total
+            from post.Post p
+            join lookup.fuel_type ft on p.fuel_type = ft.fuel_type_id   
+            group by ft.fuel_type
+            ORDER BY total DESC
+        """)
+
+        queries["status_counts"] = text(f"""
+            SELECT status, COUNT(DISTINCT VIN) as total
+            FROM {MAIN_VIEW}
+            WHERE status IS NOT NULL
+            GROUP BY status
+            ORDER BY total DESC
+        """)
+
+        queries["price_stats"] = text(f"""
+            SELECT
+                COUNT(DISTINCT VIN) as total_cars,
+                MIN(price) as min_price,
+                MAX(price) as max_price,
+                AVG(price) as avg_price
+            FROM {MAIN_VIEW}
+            WHERE price IS NOT NULL
+        """)
+
+        queries["top_models"] = text(f"""
+            SELECT TOP 10 title, brand, price, mileage
+            FROM (
+                SELECT DISTINCT VIN, title, brand, price, mileage
+                FROM {MAIN_VIEW}
+                WHERE title IS NOT NULL AND price IS NOT NULL
+            ) sub
+            ORDER BY price ASC
+        """)
+
+        feature_view = os.getenv("FEATURE_POST")
+        if feature_view:
+            queries["top_features"] = text(f"""
+                SELECT TOP 10 feature_type, COUNT(*) as total
+                FROM {feature_view}
+                WHERE feature_type IS NOT NULL
+                GROUP BY feature_type
+                ORDER BY total DESC
+            """)
+
+        results = {}
+        with db_engine.connect() as con:
+            for key, query in queries.items():
+                try:
+                    rows = con.execute(query).mappings().all()
+                    results[key] = [dict(r) for r in rows]
+                except Exception as e:
+                    results[key] = f"Error: {e}"
+
+        context_parts = []
+        if results.get("price_stats"):
+            stats = results["price_stats"][0] if results["price_stats"] else {}
+            context_parts.append(
+                f"[INVENTORY OVERVIEW]\n"
+                f"Total cars: {stats.get('total_cars', 'N/A')}\n"
+                f"Price range: ${stats.get('min_price', 0):,.0f} - ${stats.get('max_price', 0):,.0f}\n"
+                f"Average price: ${stats.get('avg_price', 0):,.0f}"
+            )
+
+        if results.get("brand_counts"):
+            lines = [f"  {r['brand']}: {r['total']} listings" for r in results["brand_counts"]]
+            context_parts.append(f"[TOP BRANDS BY LISTINGS]\n" + "\n".join(lines))
+
+        if results.get("fuel_type_counts"):
+            lines = [f"  {r['fuel_type']}: {r['total']}" for r in results["fuel_type_counts"]]
+            context_parts.append(f"[FUEL TYPE DISTRIBUTION]\n" + "\n".join(lines))
+
+        if results.get("status_counts"):
+            lines = [f"  {r['status']}: {r['total']}" for r in results["status_counts"]]
+            context_parts.append(f"[STATUS DISTRIBUTION]\n" + "\n".join(lines))
+
+        if results.get("top_features") and isinstance(results["top_features"], list):
+            lines = [f"  {r['feature_type']}: {r['total']} cars" for r in results["top_features"]]
+            context_parts.append(f"[MOST COMMON FEATURE CATEGORIES]\n" + "\n".join(lines))
+
+        if results.get("top_models"):
+            lines = []
+            for r in results["top_models"]:
+                lines.append(f"  {r['title']} ({r['brand']}) - ${r.get('price', 0):,.0f}")
+            context_parts.append(f"[BEST VALUE MODELS]\n" + "\n".join(lines))
+
+        context = "\n\n".join(context_parts)
+        print(f"[ANALYTICS] retrieved stats for: {list(results.keys())}")
+        return {"context": context, "messages": []}
+
+    def analytics_answer(state: AgenticState):
+        system_prompt = """You are a helpful car platform assistant providing website statistics.
+
+Use ONLY the provided analytics context to answer the customer's question.
+1. Present data clearly with numbers and rankings.
+2. Highlight interesting insights (e.g. dominant brand, price trends, popular fuel types).
+3. If the user asks something specific, focus on that metric.
+4. If data is not available for their exact question, share the closest relevant stats.
+5. Keep it concise and informative.
+Reply in the same language the customer is using.
+"""
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                ("system", "Platform Analytics Data:\n{context}"),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
+            ]
+        )
+        chain = prompt | llm | StrOutputParser()
+        answer = chain.invoke(
+            {
+                "context": state.get("context", ""),
+                "chat_history": state["messages"],
+                "question": state["question"],
+            }
+        )
+        print(f"[ANALYTICS ANSWER] answer={answer!r}")
+        return {"answer": answer}
+
+    def redirect_topic(state: AgenticState):
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are a friendly car sales consultant. The customer just said "
+                    "something unrelated to cars or vehicle shopping.\n"
+                    "Politely acknowledge what they said in one short sentence, then "
+                    "naturally redirect the conversation back to cars.\n"
+                    "Suggest something helpful like: asking about their car needs, "
+                    "budget, preferred brand, or if they want to explore what's available.\n"
+                    "Keep it warm, not pushy. Reply in the same language the customer is using.",
+                ),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
+            ]
+        )
+        chain = prompt | llm | StrOutputParser()
+        answer = chain.invoke(
+            {
+                "chat_history": state["messages"],
+                "question": state["question"],
+            }
+        )
+        print(f"[REDIRECT] off_topic -> redirecting user back to cars")
+        return {"answer": answer}
+
     def route_after_intent(state: AgenticState):
         intent = state.get("intent")
+        if intent == "analytics":
+            return "analytics_retrieve"
+        if intent == "specs":
+            return "spec_retrieve"
         if intent == "specific":
             return "hybrid_retrieve"
         if intent == "vague":
             return "hybrid_retrieve" if _core_complete(state["profile"]) else "ask_slot"
+        if intent == "off_topic":
+            return "redirect_topic"
         return "consult"
 
     graph = StateGraph(AgenticState)
     graph.add_node("update_profile", update_profile)
     graph.add_node("route_intent", route_intent)
     graph.add_node("ask_slot", ask_slot)
+    graph.add_node("analytics_retrieve", analytics_retrieve)
+    graph.add_node("analytics_answer", analytics_answer)
+    graph.add_node("spec_retrieve", spec_retrieve)
+    graph.add_node("spec_answer", spec_answer)
     graph.add_node("hybrid_retrieve", hybrid_retrieve)
     graph.add_node("consult", consult)
+    graph.add_node("redirect_topic", redirect_topic)
 
     graph.set_entry_point("update_profile")
     graph.add_edge("update_profile", "route_intent")
@@ -497,12 +772,20 @@ Reply in the same language the customer is using.
         "route_intent",
         route_after_intent,
         {
+            "analytics_retrieve": "analytics_retrieve",
+            "spec_retrieve": "spec_retrieve",
             "hybrid_retrieve": "hybrid_retrieve",
             "ask_slot": "ask_slot",
             "consult": "consult",
+            "redirect_topic": "redirect_topic",
         },
     )
+    graph.add_edge("analytics_retrieve", "analytics_answer")
+    graph.add_edge("analytics_answer", END)
+    graph.add_edge("spec_retrieve", "spec_answer")
+    graph.add_edge("spec_answer", END)
     graph.add_edge("ask_slot", END)
+    graph.add_edge("redirect_topic", END)
     graph.add_edge("hybrid_retrieve", "consult")
     graph.add_edge("consult", END)
     return graph.compile()
