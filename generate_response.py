@@ -38,6 +38,66 @@ COLLECTION_NAME = "car_vectorize"
 MAIN_VIEW = os.getenv("MAIN_POST", "[dbo].[view_post_info]")
 
 
+"""
+SQL View: [dbo].[view_post_info]
+select 
+    pp.post_link,
+    pp.[VIN],
+    pp.[status],
+    pp.title,
+    cb.brand,
+    pp.price,
+    pp.mileage,
+    1.00 * (pp.MPG_max + pp.MPG_min)/ 2 as mpg,
+    pp.monthly_payment,
+    lc1.color as interior_color,
+    lc2.color as exterior_color,
+    ld.drivetrain as drivetrain,
+    lf.fuel_type as fuel_type,
+    lt.transmission as transmission,
+    le.engine as engine,
+    fft.feature_type,
+    ff.feature_name
+from post.Post pp
+join core.Car cc on pp.car_model = cc.car_model
+join core.Brand cb on cc.car_brand = cb.brand_id
+JOIN seller.Seller ss on pp.seller_key = ss.seller_key
+join lookup.Color lc1 on pp.interior_color = lc1.color_id
+join lookup.Color lc2 on pp.exterior_color = lc2.color_id
+join lookup.Drivetrain ld on pp.drivetrain = ld.drivetrain_id
+JOIN lookup.Fuel_type lf on pp.fuel_type = lf.fuel_type_id
+join lookup.Transmission lt on pp.transmission = lt.transmission_id
+join lookup.Engine le on pp.engine = le.engine_id 
+join post.Post_Feature ppf on pp.VIN = ppf.VIN
+join feature.Feature ff on ppf.feature_id = ff.feature_id
+join feature.Feature_type fft on ff.feature_type_id = fft.feature_type_id
+"""
+
+"""
+SQL View: [dbo].[view_post_feature]
+select 
+    pp.VIN,
+    pp.title,
+    fft.feature_type,
+    ff.feature_name
+from post.post pp 
+join post.Post_Feature ppf on pp.VIN = ppf.VIN
+join feature.Feature ff on ppf.feature_id = ff.feature_id
+join feature.Feature_type fft on ff.feature_type_id = fft.feature_type_id
+"""
+
+
+"""
+SQL View: [dbo].[view_post_image]
+select 
+    pp.VIN,
+    pp.title,
+    ppi.image_link
+from post.Post pp  
+join post.Post_image ppi on pp.VIN = ppi.VIN
+WHERE ppi.main_image = 1
+"""
+
 # --- Helper Functions ---
 def get_image_urls(view_name: str, vin_query: str, max_images: int = 3):
     urls = []
@@ -64,6 +124,33 @@ def get_feature(view_name: str, vin_query: str):
                 feature[feature_type].append(feature_name)
 
     return dict(feature)
+
+def get_avg_price(brand: str = None, model: str = None):
+    conditions = ["p.price IS NOT NULL", "p.price > 0"]
+    params = {}
+
+    if brand:
+        conditions.append("b.brand = :brand")
+        params["brand"] = brand
+    if model:
+        conditions.append("c.car_name LIKE :model")
+        params["model"] = f"%{model}%"
+
+    query = text(f"""
+        SELECT AVG(p.price) as avg_price, MIN(p.price) as min_price,
+            MAX(p.price) as max_price, COUNT(DISTINCT p.VIN) as total
+        FROM post.Post p
+        JOIN core.Car c ON p.car_model = c.car_model
+        JOIN core.Brand b ON c.brand_id = b.brand_id
+        WHERE {' AND '.join(conditions)}
+    """)
+
+    with db_engine.connect() as con:
+        row = con.execute(query, params).mappings().first()
+        if row:
+            return dict(row)
+    return {}
+
 
 def format_docs(docs):
     if not docs:
@@ -223,8 +310,20 @@ def format_sql_cars(rows):
     image_view = os.getenv("IMAGE_POST")
     formatted = ""
 
+    seen_models = {}
+
     for i, row in enumerate(rows, 1):
-        vin = row.get("VIN", "N/A")
+        vin = row.get("VIN") or "N/A"
+        brand = row.get("brand") or ""
+        title = row.get("title") or ""
+        listing_price = row.get("price") or 0
+
+        model_key = f"{brand}_{title}".lower()
+        if model_key not in seen_models:
+            price_stats = get_avg_price(brand=brand, model=title)
+            seen_models[model_key] = price_stats
+        else:
+            price_stats = seen_models[model_key]
 
         images = get_image_urls(image_view, vin, 3) if image_view else []
         img_str = "\n".join(f"- {u}" for u in images) or "- No images available"
@@ -238,10 +337,15 @@ def format_sql_cars(rows):
         else:
             feature_str = "- No feature data"
 
+        avg_price = price_stats.get("avg_price") or listing_price
+        min_price = price_stats.get("min_price") or listing_price
+        max_price = price_stats.get("max_price") or listing_price
+
         formatted += f"""
             --- Car Option {i} ---
             VIN: {vin}
             Details Metadata: {dict(row)}
+            Average Market Price: ${avg_price:,.0f} (range: ${min_price:,.0f} - ${max_price:,.0f})
 
             Features:
             {feature_str}
@@ -287,7 +391,9 @@ class AgenticState(TypedDict):
 
 class IntentDecision(BaseModel):
     intent: str = Field(
-        description="'analytics' when the user asks about website statistics, trends, rankings, "
+        description="'compare' when the user wants to compare two or more specific cars "
+        "(e.g. 'Compare Toyota Camry vs Honda Civic', 'BMW X3 vs Audi Q5 vs Mercedes GLC'). "
+        "'analytics' when the user asks about website statistics, trends, rankings, "
         "most popular brands, most posted cars, top rated, most reviewed, inventory counts, "
         "or any aggregate/summary data about the platform. "
         "'specs' when the user asks about technical specifications, features, "
@@ -300,6 +406,18 @@ class IntentDecision(BaseModel):
     )
     brand: Optional[str] = Field(default=None, description="Exact car brand mentioned, else null.")
     model: Optional[str] = Field(default=None, description="Exact car model/name mentioned, else null.")
+
+
+class CompareItem(BaseModel):
+    brand: str = Field(description="Car brand name.")
+    model: str = Field(description="Car model name.")
+    year: Optional[int] = Field(default=None, description="Model year if mentioned, else null.")
+
+
+class CompareExtraction(BaseModel):
+    cars: list[CompareItem] = Field(
+        description="List of cars the user wants to compare (at least 2)."
+    )
 
 
 def _core_complete(profile: dict) -> bool:
@@ -316,6 +434,9 @@ def _build_agentic_app(llm, vector_store):
                 (
                     "system",
                     "You route a car consultation assistant.\n"
+                    "intent='compare' when the user wants to compare two or more specific "
+                    "cars side by side (e.g. 'Compare Toyota Camry vs Honda Civic', "
+                    "'BMW X3 vs Audi Q5', 'Difference between Corolla and Civic').\n"
                     "intent='analytics' when the user asks about website/platform statistics, "
                     "trends, rankings, popularity, inventory summary, or aggregate data "
                     "(e.g. 'What brand has the most listings?', 'Most popular car type?', "
@@ -580,107 +701,277 @@ Reply in the same language the customer is using.
         return {"answer": answer}
 
     def analytics_retrieve(state: AgenticState):
-        question = state["question"].lower()
-        queries = {}
-
-        queries["brand_counts"] = text(f"""
-            select brand, count(VIN) as total
-            from core.Car c join core.Brand b on c.brand_id = b.brand_id
-            join post.Post p on c.car_model = p.car_model
-            WHERE brand IS NOT NULL
-            GROUP BY brand
-            ORDER BY total DESC
-        """)
-
-        queries["fuel_type_counts"] = text(f"""
-            select ft.fuel_type, count(VIN) as total
-            from post.Post p
-            join lookup.fuel_type ft on p.fuel_type = ft.fuel_type_id   
-            group by ft.fuel_type
-            ORDER BY total DESC
-        """)
-
-        queries["status_counts"] = text(f"""
-            SELECT status, COUNT(DISTINCT VIN) as total
-            FROM {MAIN_VIEW}
-            WHERE status IS NOT NULL
-            GROUP BY status
-            ORDER BY total DESC
-        """)
-
-        queries["price_stats"] = text(f"""
-            SELECT
-                COUNT(DISTINCT VIN) as total_cars,
-                MIN(price) as min_price,
-                MAX(price) as max_price,
-                AVG(price) as avg_price
-            FROM {MAIN_VIEW}
-            WHERE price IS NOT NULL
-        """)
-
-        queries["top_models"] = text(f"""
-            SELECT TOP 10 title, brand, price, mileage
-            FROM (
-                SELECT DISTINCT VIN, title, brand, price, mileage
-                FROM {MAIN_VIEW}
-                WHERE title IS NOT NULL AND price IS NOT NULL
-            ) sub
-            ORDER BY price ASC
-        """)
-
+        brand = state.get("brand")
+        model = state.get("model")
         feature_view = os.getenv("FEATURE_POST")
-        if feature_view:
-            queries["top_features"] = text(f"""
-                SELECT TOP 10 feature_type, COUNT(*) as total
-                FROM {feature_view}
-                WHERE feature_type IS NOT NULL
-                GROUP BY feature_type
+
+        brand_filter = ""
+        brand_params = {}
+        if brand:
+            brand_filter = "AND b.brand = :brand"
+            brand_params["brand"] = brand
+
+        queries = {}
+        params = {}
+
+        if brand:
+            queries["brand_top_sellers"] = text(f"""
+                SELECT TOP 10 c.car_name, COUNT(p.VIN) as total_listings,
+                    AVG(p.price) as avg_price, c.car_rating, c.percentage_recommend
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                JOIN core.Brand b ON c.brand_id = b.brand_id
+                WHERE b.brand = :brand
+                GROUP BY c.car_name, c.car_rating, c.percentage_recommend
+                ORDER BY total_listings DESC, c.car_rating DESC
+            """)
+            params["brand_top_sellers"] = {"brand": brand}
+
+            queries["brand_price_stats"] = text(f"""
+                SELECT
+                    COUNT(DISTINCT p.VIN) as total_cars,
+                    MIN(p.price) as min_price,
+                    MAX(p.price) as max_price,
+                    AVG(p.price) as avg_price
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                JOIN core.Brand b ON c.brand_id = b.brand_id
+                WHERE b.brand = :brand AND p.price IS NOT NULL AND p.price > 0
+            """)
+            params["brand_price_stats"] = {"brand": brand}
+
+            queries["brand_fuel_types"] = text(f"""
+                SELECT ft.fuel_type, COUNT(p.VIN) as total
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                JOIN core.Brand b ON c.brand_id = b.brand_id
+                JOIN lookup.fuel_type ft ON p.fuel_type = ft.fuel_type_id
+                WHERE b.brand = :brand
+                GROUP BY ft.fuel_type
                 ORDER BY total DESC
             """)
+            params["brand_fuel_types"] = {"brand": brand}
+
+            queries["brand_top_rated"] = text(f"""
+                SELECT TOP 10 c.car_name, c.car_rating, c.percentage_recommend,
+                    AVG(p.price) as avg_price
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                JOIN core.Brand b ON c.brand_id = b.brand_id
+                WHERE b.brand = :brand AND c.car_rating IS NOT NULL
+                GROUP BY c.car_name, c.car_rating, c.percentage_recommend
+                ORDER BY c.car_rating DESC, c.percentage_recommend DESC
+            """)
+            params["brand_top_rated"] = {"brand": brand}
+
+            if model:
+                queries["model_top_sellers"] = text("""
+                    SELECT TOP 10 p.title, p.price, p.mileage, p.status,
+                        ft.fuel_type, p.exterior_color, c.car_rating,
+                        c.percentage_recommend, p.post_link
+                    FROM post.Post p
+                    JOIN core.Car c ON p.car_model = c.car_model
+                    JOIN core.Brand b ON c.brand_id = b.brand_id
+                    LEFT JOIN lookup.fuel_type ft ON p.fuel_type = ft.fuel_type_id
+                    WHERE b.brand = :brand AND c.car_name LIKE :model
+                        AND p.price IS NOT NULL
+                    ORDER BY p.price ASC
+                """)
+                params["model_top_sellers"] = {"brand": brand, "model": f"%{model}%"}
+
+            if feature_view:
+                queries["brand_top_features"] = text(f"""
+                    SELECT TOP 15 ff.feature_name, fft.feature_type_name, COUNT(pp.VIN) as total
+                    FROM post.Post pp
+                    JOIN core.Car c ON pp.car_model = c.car_model
+                    JOIN core.Brand b ON c.brand_id = b.brand_id
+                    JOIN post.Post_Feature ppf ON pp.VIN = ppf.VIN
+                    JOIN feature.Feature ff ON ppf.feature_id = ff.feature_id
+                    JOIN feature.Feature_type fft ON ff.feature_type_id = fft.feature_type_id
+                    WHERE b.brand = :brand
+                    GROUP BY ff.feature_name, fft.feature_type_name
+                    ORDER BY total DESC
+                """)
+                params["brand_top_features"] = {"brand": brand}
+        else:
+            queries["brand_counts"] = text("""
+                SELECT TOP 10 b.brand, COUNT(p.VIN) as total
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                JOIN core.Brand b ON c.brand_id = b.brand_id
+                WHERE b.brand IS NOT NULL
+                GROUP BY b.brand
+                ORDER BY total DESC
+            """)
+            params["brand_counts"] = {}
+
+            queries["fuel_type_counts"] = text("""
+                SELECT ft.fuel_type, COUNT(VIN) as total
+                FROM post.Post p
+                JOIN lookup.fuel_type ft ON p.fuel_type = ft.fuel_type_id
+                GROUP BY ft.fuel_type
+                ORDER BY total DESC
+            """)
+            params["fuel_type_counts"] = {}
+
+            queries["price_stats"] = text("""
+                SELECT
+                    COUNT(DISTINCT VIN) as total_cars,
+                    MIN(price) as min_price,
+                    MAX(price) as max_price,
+                    AVG(price) as avg_price
+                FROM post.Post
+                WHERE price IS NOT NULL AND price > 0
+            """)
+            params["price_stats"] = {}
+
+            queries["top_models"] = text("""
+                SELECT TOP 10 c.car_name, AVG(p.price) as price_avg,
+                    c.car_rating, c.percentage_recommend
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                GROUP BY c.car_name, c.car_rating, c.percentage_recommend
+                ORDER BY c.car_rating DESC, c.percentage_recommend DESC, price_avg ASC
+            """)
+            params["top_models"] = {}
+
+            queries["model_counts"] = text("""
+                SELECT TOP 15 c.car_name, b.brand, COUNT(p.VIN) as total_listings,
+                    AVG(p.price) as avg_price, c.car_rating
+                FROM post.Post p
+                JOIN core.Car c ON p.car_model = c.car_model
+                JOIN core.Brand b ON c.brand_id = b.brand_id
+                WHERE c.car_name IS NOT NULL
+                GROUP BY c.car_name, b.brand, c.car_rating
+                ORDER BY total_listings DESC
+            """)
+            params["model_counts"] = {}
+
+            if feature_view:
+                queries["top_features"] = text(f"""
+                    SELECT TOP 10 ff.feature_name, COUNT(pp.VIN) as total
+                    FROM post.Post pp
+                    JOIN post.Post_Feature ppf ON pp.VIN = ppf.VIN
+                    JOIN feature.Feature ff ON ppf.feature_id = ff.feature_id
+                    JOIN feature.Feature_type fft ON ff.feature_type_id = fft.feature_type_id
+                    GROUP BY ff.feature_name
+                    ORDER BY total DESC
+                """)
+                params["top_features"] = {}
 
         results = {}
         with db_engine.connect() as con:
             for key, query in queries.items():
                 try:
-                    rows = con.execute(query).mappings().all()
+                    rows = con.execute(query, params.get(key, {})).mappings().all()
                     results[key] = [dict(r) for r in rows]
                 except Exception as e:
                     results[key] = f"Error: {e}"
 
         context_parts = []
-        if results.get("price_stats"):
-            stats = results["price_stats"][0] if results["price_stats"] else {}
-            context_parts.append(
-                f"[INVENTORY OVERVIEW]\n"
-                f"Total cars: {stats.get('total_cars', 'N/A')}\n"
-                f"Price range: ${stats.get('min_price', 0):,.0f} - ${stats.get('max_price', 0):,.0f}\n"
-                f"Average price: ${stats.get('avg_price', 0):,.0f}"
-            )
 
-        if results.get("brand_counts"):
-            lines = [f"  {r['brand']}: {r['total']} listings" for r in results["brand_counts"]]
-            context_parts.append(f"[TOP BRANDS BY LISTINGS]\n" + "\n".join(lines))
+        if brand:
+            context_parts.append(f"[ANALYTICS FOR: {brand.upper()}]")
 
-        if results.get("fuel_type_counts"):
-            lines = [f"  {r['fuel_type']}: {r['total']}" for r in results["fuel_type_counts"]]
-            context_parts.append(f"[FUEL TYPE DISTRIBUTION]\n" + "\n".join(lines))
+            if results.get("brand_price_stats") and isinstance(results["brand_price_stats"], list):
+                stats = results["brand_price_stats"][0] if results["brand_price_stats"] else {}
+                context_parts.append(
+                    f"[{brand.upper()} INVENTORY]\n"
+                    f"Total listings: {stats.get('total_cars', 'N/A')}\n"
+                    f"Price range: ${stats.get('min_price', 0):,.0f} - ${stats.get('max_price', 0):,.0f}\n"
+                    f"Average price: ${stats.get('avg_price', 0):,.0f}"
+                )
 
-        if results.get("status_counts"):
-            lines = [f"  {r['status']}: {r['total']}" for r in results["status_counts"]]
-            context_parts.append(f"[STATUS DISTRIBUTION]\n" + "\n".join(lines))
+            if results.get("brand_top_sellers") and isinstance(results["brand_top_sellers"], list):
+                lines = []
+                for r in results["brand_top_sellers"]:
+                    rating = f"Rating: {r['car_rating']}/5" if r.get('car_rating') else ""
+                    recommend = f"({r['percentage_recommend']}% recommend)" if r.get('percentage_recommend') else ""
+                    lines.append(
+                        f"  {r['car_name']} - {r['total_listings']} listings, "
+                        f"avg ${r.get('avg_price', 0):,.0f} {rating} {recommend}"
+                    )
+                context_parts.append(f"[{brand.upper()} TOP SELLERS]\n" + "\n".join(lines))
 
-        if results.get("top_features") and isinstance(results["top_features"], list):
-            lines = [f"  {r['feature_type']}: {r['total']} cars" for r in results["top_features"]]
-            context_parts.append(f"[MOST COMMON FEATURE CATEGORIES]\n" + "\n".join(lines))
+            if results.get("model_top_sellers") and isinstance(results["model_top_sellers"], list):
+                lines = []
+                for i, r in enumerate(results["model_top_sellers"], 1):
+                    fuel = r.get('fuel_type', 'N/A')
+                    status = r.get('status', 'N/A')
+                    mileage = f"{r['mileage']:,.0f} mi" if r.get('mileage') else "N/A"
+                    link = r.get('post_link', '')
+                    lines.append(
+                        f"  {i}. {r.get('title', 'N/A')} | {status} | "
+                        f"${r.get('price', 0):,.0f} | {mileage} | {fuel} | "
+                        f"{r.get('exterior_color', 'N/A')}"
+                        + (f" | [View]({link})" if link else "")
+                    )
+                model_label = model.upper() if model else "MODEL"
+                context_parts.append(
+                    f"[{brand.upper()} {model_label} - TOP LISTINGS]\n" + "\n".join(lines)
+                )
 
-        if results.get("top_models"):
-            lines = []
-            for r in results["top_models"]:
-                lines.append(f"  {r['title']} ({r['brand']}) - ${r.get('price', 0):,.0f}")
-            context_parts.append(f"[BEST VALUE MODELS]\n" + "\n".join(lines))
+            if results.get("brand_top_rated") and isinstance(results["brand_top_rated"], list):
+                lines = []
+                for r in results["brand_top_rated"]:
+                    recommend = f"({r['percentage_recommend']}% recommend)" if r.get('percentage_recommend') else ""
+                    lines.append(
+                        f"  {r['car_name']} - Rating: {r.get('car_rating', 'N/A')}/5 "
+                        f"{recommend}, avg ${r.get('avg_price', 0):,.0f}"
+                    )
+                context_parts.append(f"[{brand.upper()} TOP RATED]\n" + "\n".join(lines))
+
+            if results.get("brand_fuel_types") and isinstance(results["brand_fuel_types"], list):
+                lines = [f"  {r['fuel_type']}: {r['total']}" for r in results["brand_fuel_types"]]
+                context_parts.append(f"[{brand.upper()} FUEL TYPES]\n" + "\n".join(lines))
+
+            if results.get("brand_top_features") and isinstance(results["brand_top_features"], list):
+                lines = [
+                    f"  {r['feature_name']} ({r['feature_type_name']}): {r['total']} cars"
+                    for r in results["brand_top_features"]
+                ]
+                context_parts.append(f"[{brand.upper()} TOP FEATURES]\n" + "\n".join(lines))
+        else:
+            if results.get("price_stats") and isinstance(results["price_stats"], list):
+                stats = results["price_stats"][0] if results["price_stats"] else {}
+                context_parts.append(
+                    f"[INVENTORY OVERVIEW]\n"
+                    f"Total cars: {stats.get('total_cars', 'N/A')}\n"
+                    f"Price range: ${stats.get('min_price', 0):,.0f} - ${stats.get('max_price', 0):,.0f}\n"
+                    f"Average price: ${stats.get('avg_price', 0):,.0f}"
+                )
+
+            if results.get("brand_counts") and isinstance(results["brand_counts"], list):
+                lines = [f"  {r['brand']}: {r['total']} listings" for r in results["brand_counts"]]
+                context_parts.append(f"[TOP BRANDS BY LISTINGS]\n" + "\n".join(lines))
+
+            if results.get("fuel_type_counts") and isinstance(results["fuel_type_counts"], list):
+                lines = [f"  {r['fuel_type']}: {r['total']}" for r in results["fuel_type_counts"]]
+                context_parts.append(f"[FUEL TYPE DISTRIBUTION]\n" + "\n".join(lines))
+
+            if results.get("top_features") and isinstance(results["top_features"], list):
+                lines = [f"  {r['feature_name']}: {r['total']} cars" for r in results["top_features"]]
+                context_parts.append(f"[MOST COMMON FEATURES]\n" + "\n".join(lines))
+
+            if results.get("top_models") and isinstance(results["top_models"], list):
+                lines = []
+                for r in results["top_models"]:
+                    rating = f"Rating: {r['car_rating']}/5" if r.get('car_rating') else ""
+                    lines.append(f"  {r['car_name']} - avg ${r.get('price_avg', 0):,.0f} {rating}")
+                context_parts.append(f"[TOP RATED MODELS]\n" + "\n".join(lines))
+
+            if results.get("model_counts") and isinstance(results["model_counts"], list):
+                lines = []
+                for r in results["model_counts"]:
+                    rating = f"Rating: {r['car_rating']}/5" if r.get('car_rating') else ""
+                    lines.append(
+                        f"  {r['car_name']} ({r['brand']}) - "
+                        f"{r['total_listings']} listings, avg ${r.get('avg_price', 0):,.0f} {rating}"
+                    )
+                context_parts.append(f"[TOP MODELS BY LISTINGS]\n" + "\n".join(lines))
 
         context = "\n\n".join(context_parts)
-        print(f"[ANALYTICS] retrieved stats for: {list(results.keys())}")
+        print(f"[ANALYTICS] brand={brand} model={model} keys={list(results.keys())}")
         return {"context": context, "messages": []}
 
     def analytics_answer(state: AgenticState):
@@ -713,6 +1004,135 @@ Reply in the same language the customer is using.
         print(f"[ANALYTICS ANSWER] answer={answer!r}")
         return {"answer": answer}
 
+    def compare_retrieve(state: AgenticState):
+        extractor = llm.with_structured_output(CompareExtraction)
+        extract_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "Extract ALL cars the user wants to compare. "
+                    "Return each car with its brand, model name, and year (if mentioned).",
+                ),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
+            ]
+        )
+        extraction = (extract_prompt | extractor).invoke(
+            {"chat_history": state["messages"], "question": state["question"]}
+        )
+
+        if not extraction.cars or len(extraction.cars) < 2:
+            return {
+                "context": "Could not identify at least 2 cars to compare.",
+                "messages": [],
+            }
+
+        feature_view = os.getenv("FEATURE_POST")
+        image_view = os.getenv("IMAGE_POST")
+        compare_parts = []
+        not_found = []
+
+        for car in extraction.cars:
+            constraints = CarConstraints(year=car.year) if car.year else None
+            rows = sql_search_cars(
+                brand=car.brand, model=car.model,
+                constraints=constraints, limit=1,
+            )
+
+            if not rows:
+                label = f"{car.year} {car.brand} {car.model}" if car.year else f"{car.brand} {car.model}"
+                not_found.append(label)
+                continue
+
+            row = rows[0]
+            vin = row.get("VIN") or "N/A"
+
+            price_stats = get_avg_price(brand=car.brand, model=car.model)
+            listing_price = row.get("price") or 0
+
+            avg_price = price_stats.get("avg_price") or listing_price
+            min_price = price_stats.get("min_price") or listing_price
+            max_price = price_stats.get("max_price") or listing_price
+            total_listings = price_stats.get("total") or 1
+
+            features = get_feature(feature_view, vin) if feature_view else {}
+            if features:
+                feature_str = "\n".join(
+                    f"    - {f_type}: {', '.join(f_names)}"
+                    for f_type, f_names in features.items()
+                )
+            else:
+                feature_str = "    - No feature data"
+
+            images = get_image_urls(image_view, vin, 2) if image_view else []
+            img_str = "\n".join(f"    - {u}" for u in images) or "    - No images"
+
+            compare_parts.append(
+                f"=== {car.brand.upper()} {car.model.upper()} ===\n"
+                f"  Title: {row.get('title') or 'N/A'}\n"
+                f"  Status: {row.get('status') or 'N/A'}\n"
+                f"  Average Price: ${avg_price:,.0f} (range: ${min_price:,.0f} - ${max_price:,.0f})\n"
+                f"  Total Listings: {total_listings}\n"
+                f"  Mileage: {row.get('mileage') or 'N/A'}\n"
+                f"  Engine: {row.get('engine') or 'N/A'}\n"
+                f"  Drivetrain: {row.get('drivetrain') or 'N/A'}\n"
+                f"  Fuel Type: {row.get('fuel_type') or 'N/A'}\n"
+                f"  Transmission: {row.get('transmission') or 'N/A'}\n"
+                f"  MPG: {row.get('mpg') or 'N/A'}\n"
+                f"  Exterior: {row.get('exterior_color') or 'N/A'}\n"
+                f"  Interior: {row.get('interior_color') or 'N/A'}\n"
+                f"  Post Link: {row.get('post_link') or 'N/A'}\n"
+                f"  Features:\n{feature_str}\n"
+                f"  Images:\n{img_str}"
+            )
+
+        context = "\n\n".join(compare_parts)
+        if not_found:
+            context += (
+                f"\n\n[NOT FOUND]\n"
+                f"The following cars are not available in our database:\n"
+                + "\n".join(f"  - {name}" for name in not_found)
+            )
+
+        print(f"[COMPARE] found={len(compare_parts)} not_found={not_found}")
+        print(f"[COMPARE CONTEXT]\n{context}")
+        return {"context": context, "messages": []}
+
+    def compare_answer(state: AgenticState):
+        system_prompt = """You are an expert car comparison advisor.
+
+IMPORTANT: The "Comparison Data" below contains REAL data retrieved from our database.
+You MUST use this data to create a comparison. NEVER say "I don't have information"
+if the data section contains car entries (=== BRAND MODEL ===).
+
+Instructions:
+1. For EACH car in the data (=== BRAND MODEL ===), present a side-by-side comparison:
+   Price, Engine, Drivetrain, Fuel Type, MPG, Transmission, Features.
+2. Highlight key differences and advantages of each car.
+3. Give a brief verdict: which car suits what type of buyer.
+4. Include [View Details](post_link) when a link is available.
+5. ONLY apologize for missing data if there is a [NOT FOUND] section at the end.
+Reply in the same language the customer is using.
+"""
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                ("system", "Comparison Data:\n{context}"),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
+            ]
+        )
+        chain = prompt | llm | StrOutputParser()
+        answer = chain.invoke(
+            {
+                "context": state.get("context", ""),
+                "chat_history": state["messages"],
+                "question": state["question"],
+            }
+        )
+        print(f"[COMPARE ANSWER] answer={answer!r}")
+        return {"answer": answer}
+
     def redirect_topic(state: AgenticState):
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -742,6 +1162,8 @@ Reply in the same language the customer is using.
 
     def route_after_intent(state: AgenticState):
         intent = state.get("intent")
+        if intent == "compare":
+            return "compare_retrieve"
         if intent == "analytics":
             return "analytics_retrieve"
         if intent == "specs":
@@ -758,6 +1180,8 @@ Reply in the same language the customer is using.
     graph.add_node("update_profile", update_profile)
     graph.add_node("route_intent", route_intent)
     graph.add_node("ask_slot", ask_slot)
+    graph.add_node("compare_retrieve", compare_retrieve)
+    graph.add_node("compare_answer", compare_answer)
     graph.add_node("analytics_retrieve", analytics_retrieve)
     graph.add_node("analytics_answer", analytics_answer)
     graph.add_node("spec_retrieve", spec_retrieve)
@@ -772,6 +1196,7 @@ Reply in the same language the customer is using.
         "route_intent",
         route_after_intent,
         {
+            "compare_retrieve": "compare_retrieve",
             "analytics_retrieve": "analytics_retrieve",
             "spec_retrieve": "spec_retrieve",
             "hybrid_retrieve": "hybrid_retrieve",
@@ -780,6 +1205,8 @@ Reply in the same language the customer is using.
             "redirect_topic": "redirect_topic",
         },
     )
+    graph.add_edge("compare_retrieve", "compare_answer")
+    graph.add_edge("compare_answer", END)
     graph.add_edge("analytics_retrieve", "analytics_answer")
     graph.add_edge("analytics_answer", END)
     graph.add_edge("spec_retrieve", "spec_answer")
