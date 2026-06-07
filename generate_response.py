@@ -130,8 +130,8 @@ def get_avg_price(brand: str = None, model: str = None):
     params = {}
 
     if brand:
-        conditions.append("b.brand = :brand")
-        params["brand"] = brand
+        conditions.append("b.brand LIKE :brand")
+        params["brand"] = f"%{brand}%"
     if model:
         conditions.append("c.car_name LIKE :model")
         params["model"] = f"%{model}%"
@@ -164,8 +164,9 @@ def format_docs(docs):
         if score > 1.3:
             continue
 
-        meta = doc.metadata
+        meta = dict(doc.metadata)
         vin = meta.get("VIN", "N/A")
+        meta["Post Link"] = f"https://carsalesfinder.com/vehicle/{vin}"
 
         # image URLS
         images = get_image_urls(image_view, vin, 3)
@@ -263,8 +264,8 @@ def sql_search_cars(brand=None, model=None, constraints=None, exclude_brands=Non
     params = {"limit": limit}
 
     if brand:
-        conditions.append("brand = :brand")
-        params["brand"] = brand
+        conditions.append("brand LIKE :brand")
+        params["brand"] = f"%{brand}%"
     if model:
         conditions.append("title LIKE :model")
         params["model"] = f"%{model}%"
@@ -341,10 +342,13 @@ def format_sql_cars(rows):
         min_price = price_stats.get("min_price") or listing_price
         max_price = price_stats.get("max_price") or listing_price
 
+        row_data = dict(row)
+        row_data["post_link"] = f"https://carsalesfinder.com/vehicle/{vin}"
+
         formatted += f"""
             --- Car Option {i} ---
             VIN: {vin}
-            Details Metadata: {dict(row)}
+            Details Metadata: {row_data}
             Average Market Price: ${avg_price:,.0f} (range: ${min_price:,.0f} - ${max_price:,.0f})
 
             Features:
@@ -659,7 +663,7 @@ Reply in the same language the customer is using.
                 f"Price: {row.get('price', 'N/A')}\n"
                 f"Exterior: {row.get('exterior_color', 'N/A')}\n"
                 f"Interior: {row.get('interior_color', 'N/A')}\n"
-                f"Post Link: {row.get('post_link', 'N/A')}\n"
+                f"Post Link: https://carsalesfinder.com/vehicle/{vin}\n"
                 f"Features:\n{feature_str}\n"
                 f"Images:\n{img_str}"
             )
@@ -708,8 +712,8 @@ Reply in the same language the customer is using.
         brand_filter = ""
         brand_params = {}
         if brand:
-            brand_filter = "AND b.brand = :brand"
-            brand_params["brand"] = brand
+            brand_filter = "AND b.brand LIKE :brand"
+            brand_params["brand"] = f"%{brand}%"
 
         queries = {}
         params = {}
@@ -721,11 +725,11 @@ Reply in the same language the customer is using.
                 FROM post.Post p
                 JOIN core.Car c ON p.car_model = c.car_model
                 JOIN core.Brand b ON c.brand_id = b.brand_id
-                WHERE b.brand = :brand
+                WHERE b.brand LIKE :brand
                 GROUP BY c.car_name, c.car_rating, c.percentage_recommend
                 ORDER BY total_listings DESC, c.car_rating DESC
             """)
-            params["brand_top_sellers"] = {"brand": brand}
+            params["brand_top_sellers"] = {"brand": f"%{brand}%"}
 
             queries["brand_price_stats"] = text(f"""
                 SELECT
@@ -736,9 +740,9 @@ Reply in the same language the customer is using.
                 FROM post.Post p
                 JOIN core.Car c ON p.car_model = c.car_model
                 JOIN core.Brand b ON c.brand_id = b.brand_id
-                WHERE b.brand = :brand AND p.price IS NOT NULL AND p.price > 0
+                WHERE b.brand LIKE :brand AND p.price IS NOT NULL AND p.price > 0
             """)
-            params["brand_price_stats"] = {"brand": brand}
+            params["brand_price_stats"] = {"brand": f"%{brand}%"}
 
             queries["brand_fuel_types"] = text(f"""
                 SELECT ft.fuel_type, COUNT(p.VIN) as total
@@ -746,11 +750,11 @@ Reply in the same language the customer is using.
                 JOIN core.Car c ON p.car_model = c.car_model
                 JOIN core.Brand b ON c.brand_id = b.brand_id
                 JOIN lookup.fuel_type ft ON p.fuel_type = ft.fuel_type_id
-                WHERE b.brand = :brand
+                WHERE b.brand LIKE :brand
                 GROUP BY ft.fuel_type
                 ORDER BY total DESC
             """)
-            params["brand_fuel_types"] = {"brand": brand}
+            params["brand_fuel_types"] = {"brand": f"%{brand}%"}
 
             queries["brand_top_rated"] = text(f"""
                 SELECT TOP 10 c.car_name, c.car_rating, c.percentage_recommend,
@@ -758,26 +762,26 @@ Reply in the same language the customer is using.
                 FROM post.Post p
                 JOIN core.Car c ON p.car_model = c.car_model
                 JOIN core.Brand b ON c.brand_id = b.brand_id
-                WHERE b.brand = :brand AND c.car_rating IS NOT NULL
+                WHERE b.brand LIKE :brand AND c.car_rating IS NOT NULL
                 GROUP BY c.car_name, c.car_rating, c.percentage_recommend
                 ORDER BY c.car_rating DESC, c.percentage_recommend DESC
             """)
-            params["brand_top_rated"] = {"brand": brand}
+            params["brand_top_rated"] = {"brand": f"%{brand}%"}
 
             if model:
                 queries["model_top_sellers"] = text("""
-                    SELECT TOP 10 p.title, p.price, p.mileage, p.status,
+                    SELECT TOP 10 p.VIN, p.title, p.price, p.mileage, p.status,
                         ft.fuel_type, p.exterior_color, c.car_rating,
-                        c.percentage_recommend, p.post_link
+                        c.percentage_recommend
                     FROM post.Post p
                     JOIN core.Car c ON p.car_model = c.car_model
                     JOIN core.Brand b ON c.brand_id = b.brand_id
                     LEFT JOIN lookup.fuel_type ft ON p.fuel_type = ft.fuel_type_id
-                    WHERE b.brand = :brand AND c.car_name LIKE :model
+                    WHERE b.brand LIKE :brand AND c.car_name LIKE :model
                         AND p.price IS NOT NULL
                     ORDER BY p.price ASC
                 """)
-                params["model_top_sellers"] = {"brand": brand, "model": f"%{model}%"}
+                params["model_top_sellers"] = {"brand": f"%{brand}%", "model": f"%{model}%"}
 
             if feature_view:
                 queries["brand_top_features"] = text(f"""
@@ -788,11 +792,11 @@ Reply in the same language the customer is using.
                     JOIN post.Post_Feature ppf ON pp.VIN = ppf.VIN
                     JOIN feature.Feature ff ON ppf.feature_id = ff.feature_id
                     JOIN feature.Feature_type fft ON ff.feature_type_id = fft.feature_type_id
-                    WHERE b.brand = :brand
+                    WHERE b.brand LIKE :brand
                     GROUP BY ff.feature_name, fft.feature_type_name
                     ORDER BY total DESC
                 """)
-                params["brand_top_features"] = {"brand": brand}
+                params["brand_top_features"] = {"brand": f"%{brand}%"}
         else:
             queries["brand_counts"] = text("""
                 SELECT TOP 10 b.brand, COUNT(p.VIN) as total
@@ -899,7 +903,8 @@ Reply in the same language the customer is using.
                     fuel = r.get('fuel_type', 'N/A')
                     status = r.get('status', 'N/A')
                     mileage = f"{r['mileage']:,.0f} mi" if r.get('mileage') else "N/A"
-                    link = r.get('post_link', '')
+                    vin = r.get('VIN', '')
+                    link = f"https://carsalesfinder.com/vehicle/{vin}" if vin else ""
                     lines.append(
                         f"  {i}. {r.get('title', 'N/A')} | {status} | "
                         f"${r.get('price', 0):,.0f} | {mileage} | {fuel} | "
@@ -1081,7 +1086,7 @@ Reply in the same language the customer is using.
                 f"  MPG: {row.get('mpg') or 'N/A'}\n"
                 f"  Exterior: {row.get('exterior_color') or 'N/A'}\n"
                 f"  Interior: {row.get('interior_color') or 'N/A'}\n"
-                f"  Post Link: {row.get('post_link') or 'N/A'}\n"
+                f"  Post Link: https://carsalesfinder.com/vehicle/{vin}\n"
                 f"  Features:\n{feature_str}\n"
                 f"  Images:\n{img_str}"
             )
@@ -1112,6 +1117,7 @@ Instructions:
 3. Give a brief verdict: which car suits what type of buyer.
 4. Include [View Details](post_link) when a link is available.
 5. ONLY apologize for missing data if there is a [NOT FOUND] section at the end.
+6. If there are not enough data to compare, say so honestly and offer the closest alternatives or general advice.
 Reply in the same language the customer is using.
 """
         prompt = ChatPromptTemplate.from_messages(
